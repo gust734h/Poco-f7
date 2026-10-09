@@ -1,0 +1,1011 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Criar projeto e compilar
+        run: |
+          mkdir -p poco/app/src/main/java/com/poco/optimizer
+          cd poco
+          cat > settings.gradle.kts <<'FIM0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "S21Optimizer"
+          include(":app")
+          FIM0
+          cat > build.gradle.kts <<'FIM1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIM1
+          cat > gradle.properties <<'FIM2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          FIM2
+          cat > app/build.gradle.kts <<'FIM3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.poco.optimizer"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.s21fe.optimizer"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          FIM3
+          cat > app/src/main/AndroidManifest.xml <<'FIM4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application
+                  android:allowBackup="false"
+                  android:label="S21 FE Optimizer"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FIM4
+          cat > app/src/main/java/com/poco/optimizer/Shell.kt <<'FIM5'
+          package com.poco.optimizer
+
+          import rikka.shizuku.Shizuku
+
+          /** Executa comandos de shell com a permissão do Shizuku (UID shell/ADB). */
+          object Shell {
+              private val newProcess by lazy {
+                  Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java,
+                      Array<String>::class.java,
+                      String::class.java
+                  ).apply { isAccessible = true }
+              }
+
+              fun run(cmd: String): String {
+                  val p = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText()
+                  val err = p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return (out + err).trim()
+              }
+          }
+          FIM5
+          cat > app/src/main/java/com/poco/optimizer/Optimizer.kt <<'FIM6'
+          package com.poco.optimizer
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class Optimizer(ctx: Context, private val log: (String) -> Unit) {
+
+              private val prefs = ctx.getSharedPreferences("backup", Context.MODE_PRIVATE)
+              private val self = ctx.packageName
+
+              val bloat = listOf(
+                  "com.samsung.android.bixby.agent" to "Bixby",
+                  "com.samsung.android.bixby.wakeup" to "Bixby (ativação por voz)",
+                  "com.samsung.android.visionintelligence" to "Bixby Vision",
+                  "com.samsung.android.app.spage" to "Samsung Free (tela à esquerda)",
+                  "com.samsung.android.app.tips" to "Dicas",
+                  "com.samsung.android.arzone" to "AR Zone",
+                  "com.samsung.android.ardrawing" to "AR Doodle",
+                  "com.samsung.android.kidsinstaller" to "Kids",
+                  "com.samsung.android.stickercenter" to "Sticker Center",
+                  "com.samsung.android.rubin.app" to "Serviço de personalização (sugestões e telemetria)",
+                  "com.sec.android.diagmonagent" to "Monitor de diagnóstico (telemetria)",
+                  "com.samsung.android.dqagent" to "Agente de qualidade (telemetria)",
+                  "com.microsoft.appmanager" to "Link to Windows",
+                  "com.microsoft.skydrive" to "OneDrive",
+                  "com.facebook.system" to "Facebook (pré-instalado)",
+                  "com.facebook.appmanager" to "Facebook App Manager",
+                  "com.facebook.services" to "Facebook Services",
+                  "com.netflix.partner.activation" to "Netflix (ativação)",
+                  "com.google.android.videos" to "Google TV"
+              )
+
+              private val ffPkgs = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+              private val gamingKeys = listOf(
+                  "system:min_refresh_rate", "system:peak_refresh_rate", "system:user_refresh_rate",
+                  "global:window_animation_scale", "global:transition_animation_scale", "global:animator_duration_scale",
+                  "global:disable_window_blurs", "global:zen_mode", "secure:long_press_timeout",
+                  "global:low_power", "global:low_power_trigger_level",
+                  "global:wifi_scan_always_enabled", "global:ble_scan_always_enabled",
+                  "system:haptic_feedback_enabled", "system:sound_effects_enabled", "system:lockscreen_sounds_enabled",
+                  "global:mobile_data_always_on", "system:psm_switch", "secure:refresh_rate_mode"
+              )
+
+              // ---------- base ----------
+              private fun sh(c: String) = Shell.run(c)
+
+              private fun arr(k: String) = JSONArray(prefs.getString(k, "[]")!!)
+
+              private fun each(k: String, f: (String) -> Unit) {
+                  val a = arr(k)
+                  for (i in 0 until a.length()) f(a.getString(i))
+              }
+
+              private fun remember(k: String, v: String) {
+                  val a = arr(k)
+                  for (i in 0 until a.length()) if (a.getString(i) == v) return
+                  a.put(v)
+                  prefs.edit().putString(k, a.toString()).apply()
+              }
+
+              /** Altera uma setting guardando o valor original para restaurar depois. */
+              private fun put(ns: String, key: String, value: String) {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  val k = "$ns:$key"
+                  if (!saved.has(k)) {
+                      saved.put(k, sh("settings get $ns $key"))
+                      prefs.edit().putString("settings", saved.toString()).apply()
+                  }
+                  sh("settings put $ns $key $value")
+              }
+
+              private fun revertSettings(keys: List<String>) {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  keys.forEach { k ->
+                      if (saved.has(k)) {
+                          val v = saved.getString(k)
+                          val (ns, key) = k.split(":")
+                          if (v == "null" || v.isEmpty()) sh("settings delete $ns $key")
+                          else sh("settings put $ns $key $v")
+                          saved.remove(k)
+                      }
+                  }
+                  prefs.edit().putString("settings", saved.toString()).apply()
+              }
+
+              private fun dcPut(ns: String, key: String, value: String) {
+                  remember("dc", "$ns $key")
+                  val o = sh("device_config put $ns $key $value")
+                  if (o.isNotBlank()) log("device_config: $o")
+              }
+
+              fun thirdParty() =
+                  sh("pm list packages -3").lines().map { it.removePrefix("package:").trim() }.filter { it.isNotEmpty() }
+
+              fun installedBloat(): List<Pair<String, String>> {
+                  val all = sh("pm list packages").lines().map { it.removePrefix("package:").trim() }.toSet()
+                  return bloat.filter { it.first in all }
+              }
+
+              private fun avail(): String {
+                  val n = sh("grep MemAvailable /proc/meminfo").replace(Regex("[^0-9]"), "").toLongOrNull()
+                  return if (n == null) "?" else "${n / 1024} MB"
+              }
+
+              // ---------- diagnóstico ----------
+              fun diagnostics() {
+                  log("Modelo: ${sh("getprop ro.product.model")} | Android ${sh("getprop ro.build.version.release")}")
+                  log("One UI (código): ${sh("getprop ro.build.version.oneui")} | Kernel: ${sh("uname -r")}")
+                  log("Ligado há: ${sh("uptime -p")}")
+                  log("--- Bateria ---")
+                  log(sh("dumpsys battery | grep -E 'level|temperature|health|status'"))
+                  log("(temperature = décimos de °C; 350 = 35,0 °C)")
+                  log("--- Memória ---")
+                  log(sh("grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo"))
+                  log("--- Armazenamento ---")
+                  log(sh("df -h /data | tail -1"))
+                  log("--- Temperaturas ---")
+                  log(sh("dumpsys thermalservice | grep -E 'Temperature\\{' | head -10"))
+                  log("--- Apps que mais usam RAM ---")
+                  log(sh("dumpsys meminfo | grep -A 12 'Total PSS by process'"))
+              }
+
+              fun batteryHealth() {
+                  log(sh("dumpsys battery | grep -E 'level|temperature|health|status'"))
+                  log(sh("dumpsys batterystats | grep -E 'Estimated battery capacity|Last learned battery capacity|Min learned battery capacity|Max learned battery capacity'"))
+                  for (n in listOf("cycle_count", "battery_cycle", "batt_cycle")) {
+                      val c = sh("cat /sys/class/power_supply/battery/$n 2>/dev/null").trim()
+                      if (c.toLongOrNull() != null) {
+                          log("Ciclos de carga: $c")
+                          break
+                      }
+                  }
+                  val full = sh("cat /sys/class/power_supply/battery/charge_full 2>/dev/null").trim().toLongOrNull()
+                  val design = sh("cat /sys/class/power_supply/battery/charge_full_design 2>/dev/null").trim().toLongOrNull()
+                  if (full != null && design != null && design > 0) log("Capacidade atual: ${full * 100 / design}% da original")
+                  log("Dica: no discador da Samsung, digite *#0228# para ver mais dados da bateria.")
+              }
+
+              fun cpuInfo() {
+                  log("--- Apps que mais usam CPU ---")
+                  log(sh("dumpsys cpuinfo | head -14"))
+                  log("--- Frequência dos núcleos (kHz) ---")
+                  log(sh("for i in 0 1 2 3 4 5 6 7; do echo cpu\$i \$(cat /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_cur_freq 2>/dev/null); done"))
+                  log("Governor: " + sh("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"))
+              }
+
+              fun pingTest() {
+                  log("Testando latência (cerca de 15 s)...")
+                  log("Cloudflare 1.1.1.1:")
+                  log(sh("ping -c 6 -W 2 1.1.1.1 | tail -2"))
+                  log("Google 8.8.8.8:")
+                  log(sh("ping -c 6 -W 2 8.8.8.8 | tail -2"))
+                  log("(rtt min/avg/max/mdev em ms; menos de 50 ms avg é bom para jogos)")
+              }
+
+              fun wifiInfo() {
+                  log(sh("dumpsys wifi | grep -m1 'mWifiInfo'"))
+                  log("(RSSI melhor que -65 e Link speed alto = sinal bom)")
+              }
+
+              fun wakelocks() {
+                  log("--- Wake locks ativos (apps que impedem o celular de dormir) ---")
+                  log(sh("dumpsys power | grep -E 'PARTIAL_WAKE_LOCK|Wake Locks' | head -15"))
+              }
+
+              fun refreshInfo() {
+                  log(sh("dumpsys display | grep -E 'mActiveSf|renderFrameRate|refreshRate' | head -6"))
+              }
+
+              fun showChanges() {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  log("Configurações alteradas por este app: ${saved.length()}")
+                  saved.keys().forEach { k -> log("  $k (original: ${saved.getString(k)})") }
+                  listOf(
+                      "dc" to "Ajustes avançados (device_config)",
+                      "appops" to "Apps com 2º plano bloqueado",
+                      "buckets" to "Apps com standby alterado",
+                      "game" to "Apps com modo jogo",
+                      "idle" to "Apps fora do Doze",
+                      "notif" to "Apps com notificações silenciadas",
+                      "boot" to "Apps com início automático bloqueado",
+                      "removed" to "Apps removidos"
+                  ).forEach { (k, n) -> log("$n: ${arr(k).length()}") }
+              }
+
+              // ---------- RAM e processos ----------
+              fun ramBoost() {
+                  val before = avail()
+                  sh("am kill-all")
+                  log("RAM livre: $before → ${avail()}")
+              }
+
+              fun moreRam() {
+                  dcPut("activity_manager", "max_cached_processes", "48")
+                  log("Até 48 processos em cache (mais apps abertos na RAM; efeito pleno após reiniciar).")
+              }
+
+              fun phantomProcs() {
+                  dcPut("activity_manager", "max_phantom_processes", "2147483647")
+                  put("global", "settings_enable_monitor_phantom_procs", "false")
+                  log("Limite de processos fantasma removido (o sistema pode reverter após reiniciar).")
+              }
+
+              fun systemTweaks() {
+                  put("global", "app_standby_enabled", "1")
+                  put("global", "adaptive_battery_management_enabled", "1")
+                  put("global", "cached_apps_freezer", "enabled")
+                  log("Congelador de apps em cache e bateria adaptativa ativados.")
+              }
+
+              // ---------- armazenamento e apps ----------
+              fun cleanCache() {
+                  sh("pm trim-caches 999G")
+                  log("Cache limpo.")
+              }
+
+              fun clearLogs() {
+                  sh("logcat -b all -c")
+                  log("Logs do sistema limpos.")
+              }
+
+              fun storageMaintenance() {
+                  log("Executando manutenção (TRIM) do armazenamento...")
+                  log(sh("sm idle-maint run"))
+                  log("Manutenção solicitada ao sistema.")
+              }
+
+              fun compile(mode: String) {
+                  log("Compilando apps ($mode)... pode levar vários minutos.")
+                  log(sh("cmd package compile -m $mode -a"))
+                  log(sh("cmd package bg-dexopt-job"))
+              }
+
+              fun compileApps(pkgs: List<String>, mode: String) {
+                  pkgs.forEach { log("$it: ${sh("cmd package compile -m $mode -f $it")}") }
+              }
+
+              fun compileGame() {
+                  val inst = thirdParty().filter { it in ffPkgs }
+                  if (inst.isEmpty()) log("Free Fire não encontrado neste aparelho.")
+                  else compileApps(inst, "speed")
+              }
+
+              fun compileReset() {
+                  log(sh("cmd package compile --reset -a"))
+                  log("Compilação desfeita (volta ao padrão do sistema).")
+              }
+
+              fun batteryReset() {
+                  sh("dumpsys batterystats --reset")
+                  log("Estatísticas de bateria zeradas.")
+              }
+
+              // ---------- tela, animações e toque ----------
+              fun animations(scale: String) {
+                  listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+                      .forEach { put("global", it, scale) }
+                  log("Animações em ${scale}x.")
+              }
+
+              fun refresh(min: Int, peak: Int) {
+                  put("system", "min_refresh_rate", min.toString())
+                  put("system", "peak_refresh_rate", peak.toString())
+                  put("system", "user_refresh_rate", peak.toString())
+                  val mode = if (peak <= 60) "0" else if (min >= 120) "2" else "1"
+                  put("secure", "refresh_rate_mode", mode)
+                  log("Taxa de atualização pedida: $min–$peak Hz. Se não mudar, ajuste em Configurações > Tela > Suavidade de movimento.")
+              }
+
+              fun blur(enabled: Boolean) {
+                  put("global", "disable_window_blurs", if (enabled) "0" else "1")
+                  log(if (enabled) "Desfoque de janelas ligado." else "Desfoque de janelas desligado (menos carga na GPU).")
+              }
+
+              fun darkMode(on: Boolean) {
+                  val m = if (on) "yes" else "no"
+                  sh("cmd uimode night $m")
+                  log("Modo escuro: $m (em telas AMOLED economiza bateria).")
+              }
+
+              fun screenTimeout(ms: Int) {
+                  put("system", "screen_off_timeout", ms.toString())
+                  log("A tela apaga após ${ms / 1000} s.")
+              }
+
+              fun feedbackOff(off: Boolean) {
+                  val v = if (off) "0" else "1"
+                  put("system", "haptic_feedback_enabled", v)
+                  put("system", "sound_effects_enabled", v)
+                  put("system", "lockscreen_sounds_enabled", v)
+                  log(if (off) "Vibração e sons de toque desligados." else "Vibração e sons de toque ligados.")
+              }
+
+              fun touchResponse(fast: Boolean) {
+                  put("secure", "long_press_timeout", if (fast) "250" else "400")
+                  log(if (fast) "Tempo de toque longo reduzido (250 ms)." else "Tempo de toque longo no padrão (400 ms).")
+              }
+
+              fun dnd(on: Boolean) {
+                  put("global", "zen_mode", if (on) "1" else "0")
+                  log(if (on) "Não perturbe ligado (só interrupções importantes)." else "Não perturbe desligado.")
+              }
+
+              fun batterySaverOff() {
+                  put("global", "low_power", "0")
+                  put("global", "low_power_trigger_level", "0")
+                  put("system", "psm_switch", "0")
+                  log("Economia de bateria desligada (sem limitação de CPU por ela).")
+              }
+
+              fun fixedPerf(enabled: Boolean) {
+                  val o = sh("cmd power set-fixed-performance-mode-enabled $enabled")
+                  if (enabled) remember("fpm", "on")
+                  log("Modo performance fixa: $enabled $o (experimental: pode esquentar mais).")
+              }
+
+              // ---------- rede ----------
+              fun wifiLowLatency(enabled: Boolean) {
+                  val m = if (enabled) "enabled" else "disabled"
+                  val o = sh("cmd wifi force-low-latency-mode $m")
+                  if (enabled) remember("wifi", "ll")
+                  log("Wi-Fi baixa latência: $m $o")
+              }
+
+              fun scansOff(off: Boolean) {
+                  val v = if (off) "0" else "1"
+                  put("global", "wifi_scan_always_enabled", v)
+                  put("global", "ble_scan_always_enabled", v)
+                  log(if (off) "Buscas de Wi-Fi/Bluetooth em segundo plano desligadas (menos picos de ping)." else "Buscas em segundo plano ligadas.")
+              }
+
+              fun mobileDataAlwaysOn(on: Boolean) {
+                  put("global", "mobile_data_always_on", if (on) "1" else "0")
+                  log(if (on) "Dados móveis ficam ligados junto com o Wi-Fi." else "Dados móveis não ficam ligados junto com o Wi-Fi (conexão mais estável).")
+              }
+
+              fun restartWifi() {
+                  sh("svc wifi disable")
+                  Thread.sleep(2000)
+                  sh("svc wifi enable")
+                  log("Wi-Fi reiniciado.")
+              }
+
+              fun restartData() {
+                  sh("svc data disable")
+                  Thread.sleep(2000)
+                  sh("svc data enable")
+                  log("Dados móveis reiniciados.")
+              }
+
+              fun privateDns(host: String?) {
+                  if (host == null) {
+                      put("global", "private_dns_mode", "opportunistic")
+                  } else {
+                      put("global", "private_dns_mode", "hostname")
+                      put("global", "private_dns_specifier", host)
+                  }
+                  log("DNS privado: ${host ?: "automático"}")
+              }
+
+              // ---------- apps escolhidos ----------
+              fun forceStop(pkgs: List<String>) {
+                  pkgs.forEach { sh("am force-stop $it") }
+                  log("${pkgs.size} apps encerrados.")
+              }
+
+              fun restrictBg(pkgs: List<String>) {
+                  pkgs.forEach {
+                      sh("cmd appops set $it RUN_IN_BACKGROUND ignore")
+                      sh("cmd appops set $it RUN_ANY_IN_BACKGROUND ignore")
+                      sh("am force-stop $it")
+                      remember("appops", it)
+                  }
+                  log("${pkgs.size} apps sem permissão de rodar em segundo plano (notificações podem atrasar).")
+              }
+
+              fun blockBoot(pkgs: List<String>) {
+                  pkgs.forEach {
+                      val o = sh("cmd appops set $it BOOT_COMPLETED ignore")
+                      remember("boot", it)
+                      if (o.isNotBlank()) log("$it: $o")
+                  }
+                  log("${pkgs.size} apps sem início automático.")
+              }
+
+              fun muteNotifs(pkgs: List<String>) {
+                  pkgs.forEach {
+                      sh("cmd appops set $it POST_NOTIFICATION ignore")
+                      remember("notif", it)
+                  }
+                  log("${pkgs.size} apps com notificações silenciadas.")
+              }
+
+              fun dozeWhitelist(pkgs: List<String>) {
+                  pkgs.forEach {
+                      sh("cmd deviceidle whitelist +$it")
+                      remember("idle", it)
+                  }
+                  log("${pkgs.size} apps fora da otimização de Doze (notificações mais confiáveis, gasta mais bateria).")
+              }
+
+              fun standby(pkgs: List<String>, bucket: String) {
+                  pkgs.forEach {
+                      sh("am set-standby-bucket $it $bucket")
+                      remember("buckets", it)
+                  }
+                  log("${pkgs.size} apps no nível de standby: $bucket")
+              }
+
+              fun gameMode(pkgs: List<String>, mode: String) {
+                  pkgs.forEach {
+                      val o = sh("cmd game mode $mode $it")
+                      remember("game", it)
+                      log("$it: ${if (o.isBlank()) "ok" else o}")
+                  }
+                  log("Modo jogo '$mode' enviado (o efeito depende de o jogo suportar).")
+              }
+
+              fun freefire() {
+                  val inst = thirdParty().filter { it in ffPkgs }
+                  if (inst.isEmpty()) log("Free Fire não encontrado neste aparelho.")
+                  else gameMode(inst, "performance")
+              }
+
+              fun focusMode(keep: List<String>) {
+                  val others = thirdParty().filter { it !in keep && it != self }
+                  others.forEach { sh("am force-stop $it") }
+                  sh("am kill-all")
+                  log("${others.size} apps encerrados. Mantidos: ${keep.size}.")
+              }
+
+              fun debloat(pkgs: List<String>) {
+                  pkgs.forEach { p ->
+                      val ok = sh("pm uninstall -k --user 0 $p").contains("Success")
+                      log((if (ok) "✔ " else "· falhou: ") + p)
+                      if (ok) remember("removed", p)
+                  }
+              }
+
+              fun gos(off: Boolean) {
+                  val p = "com.samsung.android.game.gos"
+                  if (off) {
+                      log(sh("pm disable-user --user 0 $p"))
+                      remember("gos", p)
+                      log("Game Optimizing Service desativado: o sistema para de limitar CPU/GPU nos jogos (esquenta mais).")
+                  } else {
+                      log(sh("pm enable $p"))
+                      log("Game Optimizing Service reativado.")
+                  }
+              }
+
+              // ---------- sistema ----------
+              fun restartLauncher() {
+                  val out = sh("cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN")
+                  val pkg = out.lines().lastOrNull { it.contains("/") }?.substringBefore("/")?.trim()
+                  if (pkg == null || pkg.isBlank()) {
+                      log("Não consegui identificar o launcher.")
+                      return
+                  }
+                  sh("am force-stop $pkg")
+                  log("Launcher reiniciado: $pkg")
+              }
+
+              fun reboot() {
+                  sh("svc power reboot")
+              }
+
+              // ---------- perfis ----------
+              fun profileGaming() {
+                  refresh(120, 120); animations("0"); blur(false); moreRam(); phantomProcs()
+                  batterySaverOff(); dnd(true); touchResponse(true); wifiLowLatency(true)
+                  scansOff(true); mobileDataAlwaysOn(false); feedbackOff(true)
+                  freefire(); ramBoost()
+                  log("🎮 Perfil Gaming aplicado. Abra o jogo agora.")
+              }
+
+              fun gamingOff() {
+                  revertSettings(gamingKeys)
+                  wifiLowLatency(false)
+                  fixedPerf(false)
+                  log("Perfil Gaming desativado (valores originais devolvidos).")
+              }
+
+              fun profilePerformance() {
+                  animations("0.5"); refresh(120, 120); blur(false); moreRam(); ramBoost()
+                  log("🚀 Perfil Desempenho aplicado.")
+              }
+
+              fun profileBalanced() {
+                  animations("1"); refresh(60, 120); blur(true); systemTweaks()
+                  log("⚖️ Perfil Equilibrado aplicado.")
+              }
+
+              fun profileBattery() {
+                  animations("0.5"); refresh(60, 60); blur(false); systemTweaks(); cleanCache(); scansOff(true)
+                  log("🔋 Perfil Economia aplicado.")
+              }
+
+              fun profileNight() {
+                  refresh(60, 60); darkMode(true); dnd(true); ramBoost()
+                  log("🌙 Perfil Noite aplicado.")
+              }
+
+              fun boost() {
+                  cleanCache(); clearLogs(); animations("0.5"); systemTweaks(); ramBoost(); batteryReset()
+                  storageMaintenance(); compile("speed-profile")
+                  log("⚡ Boost completo finalizado.")
+              }
+
+              // ---------- restaurar ----------
+              fun restore() {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  saved.keys().forEach { k ->
+                      val (ns, key) = k.split(":")
+                      val v = saved.getString(k)
+                      if (v == "null" || v.isEmpty()) sh("settings delete $ns $key")
+                      else sh("settings put $ns $key $v")
+                  }
+                  each("dc") {
+                      val (ns, key) = it.split(" ")
+                      sh("device_config delete $ns $key")
+                  }
+                  each("appops") {
+                      sh("cmd appops set $it RUN_IN_BACKGROUND default")
+                      sh("cmd appops set $it RUN_ANY_IN_BACKGROUND default")
+                  }
+                  each("boot") { sh("cmd appops set $it BOOT_COMPLETED default") }
+                  each("notif") { sh("cmd appops set $it POST_NOTIFICATION default") }
+                  each("idle") { sh("cmd deviceidle whitelist -$it") }
+                  each("buckets") { sh("am set-standby-bucket $it working_set") }
+                  each("game") { sh("cmd game mode standard $it") }
+                  each("gos") { sh("pm enable $it") }
+                  each("removed") { log(sh("cmd package install-existing $it")) }
+                  if (arr("wifi").length() > 0) sh("cmd wifi force-low-latency-mode disabled")
+                  if (arr("fpm").length() > 0) sh("cmd power set-fixed-performance-mode-enabled false")
+                  prefs.edit().clear().apply()
+                  log("Tudo restaurado ao original.")
+              }
+          }
+          FIM6
+          cat > app/src/main/java/com/poco/optimizer/MainActivity.kt <<'FIM7'
+          package com.poco.optimizer
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.View
+          import android.view.WindowInsets
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+
+              private val exec = Executors.newSingleThreadExecutor()
+              private lateinit var root: LinearLayout
+              private var container: LinearLayout? = null
+              private lateinit var status: TextView
+              private lateinit var logView: TextView
+              private val buttons = mutableListOf<Button>()
+              private lateinit var opt: Optimizer
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+              private val binderListener = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+              private val deadListener = Shizuku.OnBinderDeadListener { runOnUiThread { refresh() } }
+
+              private fun ready() =
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+              private fun say(m: String) = runOnUiThread { logView.append(m + "\n") }
+
+              /** Seção que abre e fecha ao tocar no título. */
+              private fun section(title: String, expanded: Boolean = false) {
+                  val content = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = if (expanded) View.VISIBLE else View.GONE
+                  }
+                  val head = Button(this).apply {
+                      text = (if (expanded) "▼  " else "▶  ") + title
+                      setAllCaps(false)
+                      textSize = 15f
+                      setTypeface(null, Typeface.BOLD)
+                      setOnClickListener {
+                          val open = content.visibility == View.GONE
+                          content.visibility = if (open) View.VISIBLE else View.GONE
+                          text = (if (open) "▼  " else "▶  ") + title
+                      }
+                  }
+                  root.addView(head)
+                  root.addView(content)
+                  container = content
+              }
+
+              /** Botão que executa em segundo plano. */
+              private fun add(label: String, action: () -> Unit) = addUi(label) { runTask(action) }
+
+              /** Botão que roda na tela (abre diálogos). */
+              private fun addUi(label: String, action: () -> Unit) {
+                  val b = Button(this).apply {
+                      text = label
+                      setAllCaps(false)
+                      setOnClickListener { action() }
+                  }
+                  buttons.add(b)
+                  (container ?: root).addView(b)
+              }
+
+              private fun label(p: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString()
+              } catch (e: Exception) {
+                  p
+              }
+
+              private fun multi(title: String, labels: List<String>, ids: List<String>, ok: (List<String>) -> Unit) {
+                  val checked = BooleanArray(ids.size)
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setMultiChoiceItems(labels.toTypedArray(), checked) { _, i, c -> checked[i] = c }
+                      .setPositiveButton("Aplicar") { _, _ -> ok(ids.filterIndexed { i, _ -> checked[i] }) }
+                      .setNegativeButton("Cancelar", null)
+                      .show()
+              }
+
+              private fun appsAction(title: String, run: (List<String>) -> Unit) {
+                  exec.execute {
+                      val items = opt.thirdParty()
+                          .filter { it != packageName }
+                          .map { it to label(it) }
+                          .sortedBy { it.second.lowercase() }
+                      runOnUiThread {
+                          multi(title, items.map { it.second + "\n" + it.first }, items.map { it.first }) { sel ->
+                              if (sel.isEmpty()) toast("Nada selecionado") else runTask { run(sel) }
+                          }
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  opt = Optimizer(this) { msg -> say(msg) }
+
+                  root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val pad = dp(16)
+                  root.setOnApplyWindowInsetsListener { v, ins ->
+                      val b = ins.getInsets(WindowInsets.Type.systemBars())
+                      v.setPadding(pad, b.top + pad, pad, b.bottom + pad)
+                      ins
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "S21 FE OPTIMIZER  v1"; textSize = 22f; setTypeface(null, Typeface.BOLD)
+                  })
+                  status = TextView(this).apply { setPadding(0, dp(8), 0, dp(8)) }
+                  root.addView(status)
+
+                  root.addView(Button(this).apply {
+                      text = "Conceder permissão Shizuku"
+                      setAllCaps(false)
+                      setOnClickListener {
+                          if (!Shizuku.pingBinder()) toast("Abra o app Shizuku e inicie o serviço primeiro.")
+                          else Shizuku.requestPermission(100)
+                      }
+                  })
+
+                  logView = TextView(this).apply {
+                      setTextIsSelectable(true); typeface = Typeface.MONOSPACE; textSize = 12f
+                      setPadding(0, dp(12), 0, dp(4)); text = "Toque numa seção para abrir. Os resultados aparecem aqui.\n"
+                  }
+                  root.addView(logView)
+                  root.addView(Button(this).apply {
+                      text = "Limpar resultados"; setAllCaps(false)
+                      setOnClickListener { logView.text = "" }
+                  })
+
+                  // ================= PERFIS =================
+                  section("🚀 PERFIS PRONTOS", true)
+                  add("🎮 Gaming (120 Hz, Wi-Fi rápido, sem interrupções)") { opt.profileGaming() }
+                  add("Desativar Perfil Gaming (devolve o original)") { opt.gamingOff() }
+                  add("🚀 Desempenho (120 Hz, animações rápidas, RAM livre)") { opt.profilePerformance() }
+                  add("⚖️ Equilibrado (recomendado no dia a dia)") { opt.profileBalanced() }
+                  add("🔋 Economia (60 Hz, menos efeitos, sem buscas)") { opt.profileBattery() }
+                  add("🌙 Noite (60 Hz, modo escuro, não perturbe)") { opt.profileNight() }
+                  add("⚡ BOOST COMPLETO (leva alguns minutos)") { opt.boost() }
+
+                  // ================= GAMING =================
+                  section("🎮 GAMING / BAIXA LATÊNCIA")
+                  addUi("Foco no jogo: encerrar tudo, menos o que você escolher") {
+                      appsAction("Escolha o(s) app(s) a MANTER") { opt.focusMode(it) }
+                  }
+                  add("Modo jogo (desempenho) no Free Fire") { opt.freefire() }
+                  add("Compilar Free Fire (carrega mais rápido)") { opt.compileGame() }
+                  add("Wi-Fi baixa latência: ligar") { opt.wifiLowLatency(true) }
+                  add("Wi-Fi baixa latência: desligar") { opt.wifiLowLatency(false) }
+                  add("Resposta de toque longo mais rápida") { opt.touchResponse(true) }
+                  add("Resposta de toque longo: padrão") { opt.touchResponse(false) }
+                  add("Não perturbe: ligar") { opt.dnd(true) }
+                  add("Não perturbe: desligar") { opt.dnd(false) }
+                  add("Desligar economia de bateria") { opt.batterySaverOff() }
+                  add("Performance fixa (experimental, esquenta)") { opt.fixedPerf(true) }
+                  add("Performance fixa: desligar") { opt.fixedPerf(false) }
+
+                  // ================= DIAGNÓSTICO =================
+                  section("📊 DIAGNÓSTICO")
+                  add("Diagnóstico geral (RAM, temperatura, bateria)") { opt.diagnostics() }
+                  add("Saúde da bateria (ciclos e capacidade)") { opt.batteryHealth() }
+                  add("CPU: apps pesados e frequência dos núcleos") { opt.cpuInfo() }
+                  add("Teste de latência (ping)") { opt.pingTest() }
+                  add("Sinal do Wi-Fi") { opt.wifiInfo() }
+                  add("Apps que impedem o celular de dormir") { opt.wakelocks() }
+                  add("Taxa de atualização da tela agora") { opt.refreshInfo() }
+                  add("Ver tudo que este app já alterou") { opt.showChanges() }
+
+                  // ================= RAM =================
+                  section("🧠 RAM E PROCESSOS")
+                  add("Liberar RAM agora") { opt.ramBoost() }
+                  add("Manter mais apps na RAM (48 em cache)") { opt.moreRam() }
+                  add("Impedir o Android de matar processos em 2º plano") { opt.phantomProcs() }
+                  add("Congelar apps em cache + bateria adaptativa") { opt.systemTweaks() }
+
+                  // ================= ARMAZENAMENTO =================
+                  section("💾 ARMAZENAMENTO E VELOCIDADE DOS APPS")
+                  add("Limpar cache de todos os apps") { opt.cleanCache() }
+                  add("Limpar logs do sistema") { opt.clearLogs() }
+                  add("Manutenção do armazenamento (TRIM)") { opt.storageMaintenance() }
+                  add("Compilar todos os apps - recomendado") { opt.compile("speed-profile") }
+                  add("Compilar todos os apps - máximo (usa mais espaço)") { opt.compile("speed") }
+                  addUi("Compilar só apps escolhidos (máximo)") {
+                      appsAction("Compilar apps") { opt.compileApps(it, "speed") }
+                  }
+                  add("Desfazer compilação") { opt.compileReset() }
+                  add("Zerar estatísticas de bateria") { opt.batteryReset() }
+
+                  // ================= TELA E TOQUE =================
+                  section("🖥 TELA, ANIMAÇÕES E TOQUE")
+                  add("Tela fixa em 120 Hz") { opt.refresh(120, 120) }
+                  add("Tela adaptativa 60-120 Hz") { opt.refresh(60, 120) }
+                  add("Tela fixa em 60 Hz (economia)") { opt.refresh(60, 60) }
+                  add("Animações 0.5x") { opt.animations("0.5") }
+                  add("Animações desligadas") { opt.animations("0") }
+                  add("Animações normais (1x)") { opt.animations("1") }
+                  add("Desligar desfoque de janelas") { opt.blur(false) }
+                  add("Ligar desfoque de janelas") { opt.blur(true) }
+                  add("Modo escuro: ligar (economiza em AMOLED)") { opt.darkMode(true) }
+                  add("Modo escuro: desligar") { opt.darkMode(false) }
+                  add("Desligar vibração e sons de toque") { opt.feedbackOff(true) }
+                  add("Ligar vibração e sons de toque") { opt.feedbackOff(false) }
+                  addUi("Tempo para apagar a tela") {
+                      val names = arrayOf("15 segundos", "30 segundos", "1 minuto", "2 minutos", "10 minutos")
+                      val ms = listOf(15000, 30000, 60000, 120000, 600000)
+                      AlertDialog.Builder(this)
+                          .setTitle("Apagar tela após")
+                          .setItems(names) { _, i -> runTask { opt.screenTimeout(ms[i]) } }
+                          .show()
+                  }
+
+                  // ================= REDE =================
+                  section("📶 REDE E LATÊNCIA")
+                  add("Desligar buscas de Wi-Fi/Bluetooth em 2º plano") { opt.scansOff(true) }
+                  add("Religar buscas em 2º plano") { opt.scansOff(false) }
+                  add("Dados móveis NÃO ficam ligados junto ao Wi-Fi") { opt.mobileDataAlwaysOn(false) }
+                  add("Dados móveis ligados junto ao Wi-Fi (padrão)") { opt.mobileDataAlwaysOn(true) }
+                  add("Reiniciar Wi-Fi (resolve ping alto)") { opt.restartWifi() }
+                  add("Reiniciar dados móveis") { opt.restartData() }
+                  add("DNS privado: Cloudflare") { opt.privateDns("one.one.one.one") }
+                  add("DNS privado: Google") { opt.privateDns("dns.google") }
+                  add("DNS privado: AdGuard (bloqueia anúncios)") { opt.privateDns("dns.adguard-dns.com") }
+                  add("DNS privado: automático") { opt.privateDns(null) }
+
+                  // ================= APPS =================
+                  section("📱 APPS (você escolhe na lista)")
+                  addUi("Encerrar apps selecionados") {
+                      appsAction("Encerrar apps") { opt.forceStop(it) }
+                  }
+                  addUi("Bloquear 2º plano de apps") {
+                      appsAction("Bloquear segundo plano") { opt.restrictBg(it) }
+                  }
+                  addUi("Bloquear início automático de apps") {
+                      appsAction("Bloquear início automático") { opt.blockBoot(it) }
+                  }
+                  addUi("Silenciar notificações de apps") {
+                      appsAction("Silenciar notificações") { opt.muteNotifs(it) }
+                  }
+                  addUi("Apps importantes: fora do Doze (notificações confiáveis)") {
+                      appsAction("Manter ativos no Doze") { opt.dozeWhitelist(it) }
+                  }
+                  addUi("Standby de apps (escolher nível)") {
+                      val names = arrayOf("restricted (máxima economia)", "rare", "frequent", "working_set (padrão)", "active")
+                      val vals = listOf("restricted", "rare", "frequent", "working_set", "active")
+                      AlertDialog.Builder(this)
+                          .setTitle("Nível de standby")
+                          .setItems(names) { _, i -> appsAction("Apps: " + vals[i]) { opt.standby(it, vals[i]) } }
+                          .show()
+                  }
+                  addUi("Modo jogo: desempenho para apps selecionados") {
+                      appsAction("Modo jogo") { opt.gameMode(it, "performance") }
+                  }
+
+                  // ================= SAMSUNG =================
+                  section("🌀 SAMSUNG ONE UI")
+                  add("Desativar Game Optimizing Service (experimental, esquenta)") { opt.gos(true) }
+                  add("Reativar Game Optimizing Service") { opt.gos(false) }
+                  add("Taxa de atualização da tela agora") { opt.refreshInfo() }
+
+                  // ================= LIMPEZA =================
+                  section("🧹 LIMPEZA SAMSUNG (reversível)")
+                  addUi("Remover bloatware e anúncios (escolher na lista)") {
+                      exec.execute {
+                          val list = opt.installedBloat()
+                          runOnUiThread {
+                              if (list.isEmpty()) toast("Nenhum bloatware conhecido encontrado.")
+                              else multi(
+                                  "Remover (RESTAURAR desfaz)",
+                                  list.map { it.second + "\n" + it.first },
+                                  list.map { it.first }
+                              ) { sel -> if (sel.isNotEmpty()) runTask { opt.debloat(sel) } }
+                          }
+                      }
+                  }
+
+                  // ================= SISTEMA =================
+                  section("🔧 SISTEMA")
+                  add("Reiniciar o launcher (corrige travadas da tela inicial)") { opt.restartLauncher() }
+                  addUi("Reiniciar o celular agora") {
+                      AlertDialog.Builder(this)
+                          .setTitle("Reiniciar")
+                          .setMessage("Salve o que estiver fazendo. O celular vai reiniciar agora.")
+                          .setPositiveButton("Reiniciar") { _, _ -> runTask { opt.reboot() } }
+                          .setNegativeButton("Cancelar", null)
+                          .show()
+                  }
+
+                  // ================= RESTAURAR =================
+                  section("♻️ RESTAURAR")
+                  add("♻️ RESTAURAR tudo ao original") { opt.restore() }
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  Shizuku.addRequestPermissionResultListener(permListener)
+                  Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  Shizuku.addBinderDeadListener(deadListener)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ok = ready()
+                  status.text = when {
+                      !Shizuku.pingBinder() -> "● Shizuku não está rodando"
+                      !ok -> "● Shizuku ativo, falta permissão"
+                      else -> "● Pronto"
+                  }
+                  buttons.forEach { it.isEnabled = ok }
+              }
+
+              private fun runTask(action: () -> Unit) {
+                  buttons.forEach { it.isEnabled = false }
+                  exec.execute {
+                      try {
+                          action()
+                          say("✔ Concluído")
+                      } catch (e: Throwable) {
+                          say("Erro: ${e.message}")
+                      }
+                      runOnUiThread { refresh() }
+                  }
+              }
+
+              override fun onDestroy() {
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  Shizuku.removeBinderReceivedListener(binderListener)
+                  Shizuku.removeBinderDeadListener(deadListener)
+                  super.onDestroy()
+              }
+          }
+          FIM7
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: S21FE-Optimizer-apk
+          path: poco/app/build/outputs/apk/debug/app-debug.apk
